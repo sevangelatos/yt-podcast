@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
-yt-podcast: Translate YouTube video audio with expressive AI voice.
+yt-podcast: Translate YouTube video audio using SeamlessStreaming (S2ST).
 
 Downloads audio from a YouTube video using yt-dlp and translates it
-using Meta's SeamlessExpressive — a speech-to-speech translation model
-that preserves the speaker's prosody, emotion, and pacing.
+using Meta's SeamlessStreaming — a simultaneous speech-to-speech
+translation model from facebook/seamless-streaming.
 
-Audio is split at detected silence boundaries (between words/sentences)
-to avoid cutting mid-utterance, while keeping chunks large enough for
-the translation model to produce high-quality output.
+The model processes audio as a continuous stream using SimulEval's
+agent pipeline. Audio is fed in 1-second segments (vs 20ms for true
+realtime) because the w2v-BERT encoder re-encodes all accumulated
+frames on every push — larger segments reduce push count and avoid
+O(n^2) slowdown. The monotonic attention and early-stop mechanism
+handle natural segmentation at sentence boundaries.
 
 Requirements:
-    pip install seamless_communication
+    pip install fairseq2==0.2.1  # pulls torch==2.2.2
+    pip install seamless_communication  # from GitHub
+    pip install simuleval~=1.1.3 torchaudio sentencepiece
     yt-dlp and ffmpeg must be available on PATH.
-    SeamlessExpressive weights require Meta approval — see README.
 
 Usage:
     python translate.py "https://youtube.com/watch?v=..." -o output.mp3
     python translate.py "https://youtube.com/watch?v=..." --tgt-lang fra
-    python translate.py "https://youtube.com/watch?v=..." --duration-factor 1.1
+    python translate.py "https://youtube.com/watch?v=..." --tgt-lang deu --speaker-id 3
 """
 
 import argparse
@@ -27,10 +31,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from argparse import Namespace
 from pathlib import Path
 
 import torch
 import torchaudio
+from simuleval.data.segments import SpeechSegment, EmptySegment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,139 +49,76 @@ logger = logging.getLogger("yt-podcast")
 # Constants
 # ---------------------------------------------------------------------------
 
-INPUT_SAMPLE_RATE = 16_000  # SeamlessExpressive expects 16 kHz input
+INPUT_SAMPLE_RATE = 16_000  # SeamlessStreaming expects 16 kHz input
+OUTPUT_SAMPLE_RATE = 16_000  # Vocoder outputs 16 kHz
 SUPPORTED_FORMATS = ("wav", "mp3", "ogg")
 
-# Target languages supported by SeamlessExpressive
+# Source segment size in samples.
+# The OfflineWav2VecBertEncoderAgent re-encodes ALL accumulated fbank frames
+# on every push(), so fewer, larger pushes are dramatically faster for offline
+# use. 16000 samples = 1 second is a good balance (vs 320 = 20ms for realtime).
+SOURCE_SEGMENT_SIZE = 16_000
+
+# Safety limit: max fbank frames before forcing a pipeline reset to prevent OOM.
+# The w2v-BERT encoder accumulates fbanks between early-stop resets.
+# At 10ms per frame, 6000 frames = ~60 seconds. On an 8GB GPU this uses ~4-5GB.
+MAX_FBANK_FRAMES_BEFORE_RESET = 6000
+
+# Target languages supported by SeamlessStreaming S2ST
 SUPPORTED_LANGUAGES = {
-    "eng": "English",
-    "fra": "French",
+    "arb": "Arabic",
+    "ben": "Bengali",
+    "cat": "Catalan",
+    "ces": "Czech",
+    "cmn": "Mandarin Chinese",
+    "cym": "Welsh",
+    "dan": "Danish",
     "deu": "German",
+    "eng": "English",
+    "est": "Estonian",
+    "fin": "Finnish",
+    "fra": "French",
+    "hin": "Hindi",
+    "ind": "Indonesian",
+    "ita": "Italian",
+    "jpn": "Japanese",
+    "kan": "Kannada",
+    "kor": "Korean",
+    "mlt": "Maltese",
+    "nld": "Dutch",
+    "pes": "Persian",
+    "pol": "Polish",
+    "por": "Portuguese",
+    "ron": "Romanian",
+    "rus": "Russian",
+    "slk": "Slovak",
     "spa": "Spanish",
-    "cmn": "Mandarin (experimental)",
-    "ita": "Italian (experimental)",
+    "swe": "Swedish",
+    "swh": "Swahili",
+    "tam": "Tamil",
+    "tel": "Telugu",
+    "tgl": "Tagalog",
+    "tha": "Thai",
+    "tur": "Turkish",
+    "ukr": "Ukrainian",
+    "urd": "Urdu",
+    "uzn": "Uzbek",
+    "vie": "Vietnamese",
 }
-
-# Chunking defaults
-DEFAULT_MIN_CHUNK = 15   # seconds — don't split before this
-DEFAULT_MAX_CHUNK = 30   # seconds — force-split if no silence found
-DEFAULT_SILENCE_THRESH = -25  # dBFS
-MIN_SILENCE_DURATION_MS = 150  # minimum silence length to count as a split point
-FRAME_MS = 20  # RMS energy analysis frame size in milliseconds
-
-
-# ---------------------------------------------------------------------------
-# Silence detection & chunking
-# ---------------------------------------------------------------------------
-
-def find_silence_regions(
-    waveform: torch.Tensor,
-    thresh_dbfs: float = DEFAULT_SILENCE_THRESH,
-    min_silence_ms: int = MIN_SILENCE_DURATION_MS,
-) -> list[tuple[int, int]]:
-    """Find silence regions in the waveform.
-
-    Returns a list of (start_sample, end_sample) tuples for each region
-    where the RMS energy stays below *thresh_dbfs* (relative to peak
-    amplitude) for at least *min_silence_ms* milliseconds.
-    """
-    mono = waveform.squeeze(0)  # (samples,)
-    frame_samples = FRAME_MS * INPUT_SAMPLE_RATE // 1000  # 320 samples at 16 kHz
-
-    # Compute per-frame RMS energy
-    n_frames = mono.shape[0] // frame_samples
-    trimmed = mono[: n_frames * frame_samples]
-    frames = trimmed.view(n_frames, frame_samples)
-    rms = frames.float().pow(2).mean(dim=1).sqrt()
-
-    # Convert threshold from dBFS (relative to peak) to linear amplitude
-    peak = mono.abs().max().float()
-    if peak < 1e-8:
-        return [(0, mono.shape[0])]
-    thresh_linear = peak * (10.0 ** (thresh_dbfs / 20.0))
-
-    # Find contiguous runs of quiet frames
-    is_quiet = rms < thresh_linear
-    min_quiet_frames = max(1, min_silence_ms * INPUT_SAMPLE_RATE // (1000 * frame_samples))
-
-    regions: list[tuple[int, int]] = []
-    run_start: int | None = None
-    for i in range(n_frames):
-        if is_quiet[i]:
-            if run_start is None:
-                run_start = i
-        else:
-            if run_start is not None and (i - run_start) >= min_quiet_frames:
-                regions.append((run_start * frame_samples, i * frame_samples))
-            run_start = None
-
-    if run_start is not None and (n_frames - run_start) >= min_quiet_frames:
-        regions.append((run_start * frame_samples, n_frames * frame_samples))
-
-    return regions
-
-
-def chunk_audio_at_silences(
-    waveform: torch.Tensor,
-    silence_regions: list[tuple[int, int]],
-    min_chunk_s: int = DEFAULT_MIN_CHUNK,
-    max_chunk_s: int = DEFAULT_MAX_CHUNK,
-) -> list[torch.Tensor]:
-    """Split waveform at silence boundaries, respecting min/max chunk sizes."""
-    total_samples = waveform.shape[-1]
-    min_samples = min_chunk_s * INPUT_SAMPLE_RATE
-    max_samples = max_chunk_s * INPUT_SAMPLE_RATE
-
-    chunks: list[torch.Tensor] = []
-    chunk_start = 0
-    si = 0
-
-    while chunk_start < total_samples:
-        remaining = total_samples - chunk_start
-
-        if remaining <= max_samples:
-            if remaining >= INPUT_SAMPLE_RATE // 2:
-                chunks.append(waveform[..., chunk_start:total_samples])
-            break
-
-        while si < len(silence_regions) and silence_regions[si][1] <= chunk_start:
-            si += 1
-
-        split_at: int | None = None
-        for j in range(si, len(silence_regions)):
-            s_start, s_end = silence_regions[j]
-            mid = (s_start + s_end) // 2
-            if mid <= chunk_start + min_samples:
-                continue
-            if mid > chunk_start + max_samples:
-                break
-            split_at = mid
-            break
-
-        if split_at is None:
-            split_at = chunk_start + max_samples
-
-        chunks.append(waveform[..., chunk_start:split_at])
-        chunk_start = split_at
-
-    # Validate: no audio was lost
-    total_chunked = sum(c.shape[-1] for c in chunks)
-    assert total_chunked == total_samples, (
-        f"Audio loss detected: {total_samples} samples in, {total_chunked} samples chunked "
-        f"(delta={total_samples - total_chunked})"
-    )
-
-    return chunks
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _check_prerequisites() -> None:
     for prog in ("yt-dlp", "ffmpeg"):
         if shutil.which(prog) is None:
-            print(f"Error: '{prog}' not found on PATH. Please install it.", file=sys.stderr)
+            print(
+                f"Error: '{prog}' not found on PATH. Please install it.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
 
@@ -184,9 +128,12 @@ def download_audio(url: str, work_dir: Path) -> Path:
     cmd = [
         "yt-dlp",
         "--extract-audio",
-        "--audio-format", "wav",
-        "--postprocessor-args", f"ffmpeg:-ar {INPUT_SAMPLE_RATE} -ac 1",
-        "-o", str(work_dir / "source_audio.%(ext)s"),
+        "--audio-format",
+        "wav",
+        "--postprocessor-args",
+        f"ffmpeg:-ar {INPUT_SAMPLE_RATE} -ac 1",
+        "-o",
+        str(work_dir / "source_audio.%(ext)s"),
         url,
     ]
     print(f"Downloading audio from: {url}")
@@ -212,183 +159,229 @@ def convert_audio(src: Path, dst: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SeamlessExpressive translation
+# Streaming pipeline
 # ---------------------------------------------------------------------------
 
-def load_expressive_model(device: torch.device, dtype: torch.dtype, gated_model_dir: Path | None = None):
-    """Load SeamlessExpressive Translator + PretsselGenerator.
 
-    Returns (translator, pretssel_generator, prosody_fbank_extractor, gcmvn_mean, gcmvn_std).
-    """
-    from fairseq2.data.audio import WaveformToFbankConverter
-
-    from seamless_communication.cli.expressivity.predict.pretssel_generator import (
-        PretsselGenerator,
-    )
-    from seamless_communication.inference import Translator
-    from seamless_communication.models.unity import (
-        load_gcmvn_stats,
-        load_unity_unit_tokenizer,
-    )
-    from seamless_communication.store import add_gated_assets
-
-    model_name = "seamless_expressivity"
-    vocoder_name = "vocoder_pretssel"
-
-    if gated_model_dir:
-        add_gated_assets(gated_model_dir)
-
-    print("Loading SeamlessExpressive models …")
-
-    unit_tokenizer = load_unity_unit_tokenizer(model_name)
-
-    translator = Translator(
-        model_name,
-        vocoder_name_or_card=None,
-        device=device,
-        dtype=dtype,
-    )
-
-    pretssel_generator = PretsselGenerator(
-        vocoder_name,
-        vocab_info=unit_tokenizer.vocab_info,
-        device=device,
-        dtype=dtype,
-    )
-
-    # Fbank extractor for prosody input only (no standardization — GCMVN is applied instead).
-    # The Translator handles its own fbank extraction internally (with standardize=True)
-    # when we pass raw audio tensors as input.
-    prosody_fbank_extractor = WaveformToFbankConverter(
-        num_mel_bins=80,
-        waveform_scale=2**15,
-        channel_last=True,
-        standardize=False,
-        device=device,
-        dtype=dtype,
-    )
-
-    _gcmvn_mean, _gcmvn_std = load_gcmvn_stats(vocoder_name)
-    gcmvn_mean = torch.tensor(_gcmvn_mean, device=device, dtype=dtype)
-    gcmvn_std = torch.tensor(_gcmvn_std, device=device, dtype=dtype)
-
-    print("Models loaded.\n")
-
-    return translator, pretssel_generator, prosody_fbank_extractor, gcmvn_mean, gcmvn_std
-
-
-def _prepare_prosody_input(
-    chunk: torch.Tensor,
-    prosody_fbank_extractor,
-    gcmvn_mean: torch.Tensor,
-    gcmvn_std: torch.Tensor,
-    device: torch.device,
-):
-    """Prepare GCMVN-normalized fbank features for the prosody encoder.
-
-    The main encoder input is handled by Translator.predict() internally
-    when we pass raw audio tensors. This function only produces the
-    GCMVN-normalized prosody input needed by both predict() and the
-    PretsselGenerator.
-
-    Returns src_gcmvn as a SequenceData dict.
-    """
-    from fairseq2.data import SequenceData
-
-    # chunk shape: (1, samples) → (samples, 1) for fbank extractor (channel_last=True)
-    wav = chunk.squeeze(0).unsqueeze(1).to(device)
-
-    data = prosody_fbank_extractor({"waveform": wav, "sample_rate": INPUT_SAMPLE_RATE})
-    fbank = data["fbank"]
-
-    # GCMVN normalization for prosody encoder
-    gcmvn_fbank = fbank.subtract(gcmvn_mean).divide(gcmvn_std)
-
-    src_gcmvn = SequenceData(
-        seqs=gcmvn_fbank.unsqueeze(0),
-        seq_lens=torch.LongTensor([gcmvn_fbank.shape[0]]),
-        is_ragged=False,
-    )
-
-    return src_gcmvn
-
-
-def translate_chunks(
-    chunks: list[torch.Tensor],
-    translator,
-    pretssel_generator,
-    prosody_fbank_extractor,
-    gcmvn_mean: torch.Tensor,
-    gcmvn_std: torch.Tensor,
+def build_streaming_args(
+    device: str,
+    dtype: str,
     tgt_lang: str,
-    duration_factor: float,
-    device: torch.device,
-) -> tuple[list[torch.Tensor], int]:
-    """Translate audio chunks using SeamlessExpressive.
+    speaker_id: int,
+) -> Namespace:
+    """Build the args namespace required by SeamlessStreamingS2STAgent."""
+    return Namespace(
+        # Task
+        task="s2st",
+        # Model names
+        unity_model_name="seamless_streaming_unity",
+        monotonic_decoder_model_name="seamless_streaming_monotonic_decoder",
+        # Device / precision
+        device=device,
+        dtype=dtype,
+        fp16=(dtype == "fp16"),
+        # Feature extractor
+        sample_rate=INPUT_SAMPLE_RATE,
+        shift_size=10,
+        window_size=25,
+        feature_dim=80,
+        denormalize=True,
+        # Wav2Vec-BERT encoder
+        min_starting_wait_w2vbert=192,
+        # Text decoder (monotonic attention)
+        max_len_a=0,
+        max_len_b=100,
+        max_consecutive_write=50,
+        min_starting_wait=1,
+        no_early_stop=True,
+        tgt_lang=tgt_lang,
+        decision_threshold=0.5,
+        decision_method="min",
+        p_choose_start_layer=0,
+        block_ngrams=False,
+        # Unit decoder (NAR T2U)
+        min_unit_chunk_size=50,
+        d_factor=1.0,
+        # Vocoder
+        vocoder_name="vocoder_v2",
+        vocoder_speaker_id=speaker_id,
+        # SimulEval
+        source_segment_size=SOURCE_SEGMENT_SIZE,
+    )
 
-    Returns (list_of_waveform_tensors, output_sample_rate).
+
+def load_pipeline(args: Namespace):
+    """Load the SeamlessStreamingS2STAgent pipeline."""
+    from seamless_communication.streaming.agents.seamless_streaming_s2st import (
+        SeamlessStreamingS2STAgent,
+    )
+
+    print("Loading SeamlessStreaming pipeline...")
+    t0 = time.time()
+    agent = SeamlessStreamingS2STAgent(args)
+    elapsed = time.time() - t0
+    print(f"Pipeline loaded in {elapsed:.1f}s\n")
+    return agent
+
+
+def _get_encoder_fbank_count(agent) -> int:
+    """Return the number of accumulated fbank frames in the w2v-BERT encoder."""
+    # module_list[1] is OfflineWav2VecBertEncoderAgent
+    try:
+        return len(agent.module_list[1].states.source)
+    except (IndexError, AttributeError):
+        return 0
+
+
+def translate_streaming(
+    waveform: torch.Tensor,
+    agent,
+    tgt_lang: str,
+) -> torch.Tensor:
     """
-    translated: list[torch.Tensor] = []
-    total_src = 0.0
-    total_tgt = 0.0
-    output_sr = INPUT_SAMPLE_RATE  # updated from pretssel output
+    Stream audio through the SeamlessStreaming pipeline.
 
-    for i, chunk in enumerate(chunks, 1):
-        src_dur = chunk.shape[-1] / INPUT_SAMPLE_RATE
-        total_src += src_dur
+    Feeds audio in 1-second segments (16000 samples at 16 kHz) for efficient
+    offline processing. The pipeline's monotonic attention and early-stop
+    mechanism handle natural segmentation at sentence boundaries.
 
-        print(f"  Translating chunk {i}/{len(chunks)} (source: {src_dur:.1f}s) … ", end="", flush=True)
+    The OfflineWav2VecBertEncoderAgent re-encodes ALL accumulated fbank frames
+    on every push(). Using larger segments dramatically reduces the number of
+    encoder calls and avoids the O(n^2) slowdown from tiny 20ms chunks.
 
-        # Prepare GCMVN-normalized prosody input for the prosody encoder.
-        # The main encoder fbank input is computed internally by Translator.predict()
-        # when we pass the raw audio tensor.
-        src_gcmvn = _prepare_prosody_input(
-            chunk, prosody_fbank_extractor, gcmvn_mean, gcmvn_std, device
-        )
+    A safety reset prevents OOM if the encoder accumulates too many frames
+    without an early-stop reset (e.g., during long silences or music).
 
-        # Pass raw audio tensor — Translator converts to fbank internally
-        # with standardize=True, matching its training config.
-        text_output, unit_output = translator.predict(
-            chunk.squeeze(0),  # (samples,) — predict expects 1D or 2D tensor
-            "s2st",
-            tgt_lang,
-            duration_factor=duration_factor,
-            prosody_encoder_input=src_gcmvn,
-        )
+    Returns the full translated waveform (1-D float32 CPU tensor at 16 kHz).
+    """
+    # Flatten to 1-D
+    samples = waveform.squeeze().tolist()
+    total_samples = len(samples)
+    total_dur = total_samples / INPUT_SAMPLE_RATE
 
-        assert unit_output is not None
-        speech_output = pretssel_generator.predict(
-            unit_output.units,
+    chunk_ms = SOURCE_SEGMENT_SIZE / INPUT_SAMPLE_RATE * 1000
+    print(f"  Streaming {total_dur:.1f}s of audio ({total_samples} samples)")
+    print(f"  Segment size: {SOURCE_SEGMENT_SIZE} samples ({chunk_ms:.0f}ms)")
+
+    # Reset pipeline state
+    agent.reset()
+
+    collected_audio: list[list[float]] = []
+    num_segments_pushed = 0
+    num_output_chunks = 0
+    num_safety_resets = 0
+    t0 = time.time()
+
+    # Progress interval: report every ~10 seconds of source audio
+    progress_interval = max(1, int(10 * INPUT_SAMPLE_RATE / SOURCE_SEGMENT_SIZE))
+
+    # Phase 1: Feed audio segments
+    for offset in range(0, total_samples, SOURCE_SEGMENT_SIZE):
+        end = min(offset + SOURCE_SEGMENT_SIZE, total_samples)
+        chunk = samples[offset:end]
+        is_last = end >= total_samples
+
+        # Safety check: if the encoder has accumulated too many fbank frames
+        # without an early-stop reset, force a reset to prevent OOM.
+        fbank_count = _get_encoder_fbank_count(agent)
+        if fbank_count > MAX_FBANK_FRAMES_BEFORE_RESET:
+            logger.info(
+                f"Safety reset at src={offset / INPUT_SAMPLE_RATE:.0f}s "
+                f"(encoder had {fbank_count} fbank frames)"
+            )
+            agent.reset()
+            num_safety_resets += 1
+
+        segment = SpeechSegment(
+            content=chunk,
+            sample_rate=INPUT_SAMPLE_RATE,
+            finished=is_last,
             tgt_lang=tgt_lang,
-            prosody_encoder_input=src_gcmvn,
         )
 
-        output_sr = speech_output.sample_rate
-        wav = speech_output.audio_wavs[0][0].to(torch.float32).cpu()
-        tgt_dur = wav.shape[-1] / output_sr
-        total_tgt += tgt_dur
-        print(f"translated: {tgt_dur:.1f}s")
+        agent.push(segment)
+        num_segments_pushed += 1
 
-        translated.append(wav)
+        # Pop any available output
+        output = agent.pop()
+        if not output.is_empty and hasattr(output, "content") and len(output.content) > 0:
+            collected_audio.append(output.content)
+            num_output_chunks += 1
 
-    print(f"\n  Total source: {total_src:.1f}s → total translated: {total_tgt:.1f}s")
+        # Progress reporting
+        if num_segments_pushed % progress_interval == 0:
+            src_time = end / INPUT_SAMPLE_RATE
+            out_samples = sum(len(c) for c in collected_audio)
+            out_time = out_samples / OUTPUT_SAMPLE_RATE
+            elapsed = time.time() - t0
+            speed = src_time / elapsed if elapsed > 0 else 0
+            print(
+                f"  [{src_time:.0f}s/{total_dur:.0f}s] "
+                f"output: {out_time:.1f}s, "
+                f"speed: {speed:.1f}x realtime"
+            )
 
-    return translated, output_sr
+    # Phase 2: Drain — keep popping until pipeline signals finished
+    max_drain_iters = 5000
+    for drain_i in range(max_drain_iters):
+        output = agent.pop()
+        if not output.is_empty and hasattr(output, "content") and len(output.content) > 0:
+            collected_audio.append(output.content)
+            num_output_chunks += 1
+        if output.finished:
+            break
+        # Push empty finished segments to drive the pipeline forward
+        empty = SpeechSegment(
+            content=[],
+            sample_rate=INPUT_SAMPLE_RATE,
+            finished=True,
+            tgt_lang=tgt_lang,
+        )
+        agent.push(empty)
+    else:
+        logger.warning(
+            f"Drain did not finish after {max_drain_iters} iterations — "
+            "some audio may be truncated."
+        )
+
+    elapsed = time.time() - t0
+
+    if not collected_audio:
+        print("Error: no audio output was produced.", file=sys.stderr)
+        sys.exit(1)
+
+    # Flatten all output chunks into a single tensor
+    all_samples: list[float] = []
+    for chunk in collected_audio:
+        all_samples.extend(chunk)
+
+    result = torch.tensor(all_samples, dtype=torch.float32)
+    out_dur = len(all_samples) / OUTPUT_SAMPLE_RATE
+
+    print(f"\n  Total: {total_dur:.1f}s source -> {out_dur:.1f}s translated")
+    print(f"  Chunks produced: {num_output_chunks}")
+    if num_safety_resets > 0:
+        print(f"  Safety resets: {num_safety_resets}")
+    print(f"  Wall time: {elapsed:.1f}s ({total_dur / elapsed:.1f}x realtime)")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
-    lang_list = ", ".join(f"{k} ({v})" for k, v in SUPPORTED_LANGUAGES.items())
+    lang_list = ", ".join(sorted(SUPPORTED_LANGUAGES.keys()))
     parser = argparse.ArgumentParser(
-        description="Translate YouTube video audio with expressive AI voice (SeamlessExpressive).",
+        description="Translate YouTube video audio using SeamlessStreaming (S2ST).",
         epilog=f"Supported target languages: {lang_list}",
     )
     parser.add_argument("url", nargs="?", help="YouTube video URL")
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         default="translated.mp3",
         help="Output file path; format from extension: wav, mp3, ogg (default: translated.mp3)",
     )
@@ -399,39 +392,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target language code (default: eng)",
     )
     parser.add_argument(
-        "--duration-factor",
-        type=float,
-        default=1.0,
-        help="Duration factor to tune speech rate; >1 = slower, <1 = faster (default: 1.0)",
-    )
-    parser.add_argument(
-        "--gated-model-dir",
-        type=Path,
-        default=None,
-        help="Path to locally downloaded SeamlessExpressive model directory (if not using HF Hub)",
+        "--speaker-id",
+        type=int,
+        default=-1,
+        help="Vocoder speaker ID; -1 uses the default voice for the language (default: -1)",
     )
     parser.add_argument(
         "--device",
         default=None,
-        help="Compute device: cuda, cpu, mps (auto-detected if omitted)",
-    )
-    parser.add_argument(
-        "--min-chunk",
-        type=int,
-        default=DEFAULT_MIN_CHUNK,
-        help=f"Minimum chunk duration in seconds (default: {DEFAULT_MIN_CHUNK})",
-    )
-    parser.add_argument(
-        "--max-chunk",
-        type=int,
-        default=DEFAULT_MAX_CHUNK,
-        help=f"Maximum chunk duration in seconds — force-split if no silence found (default: {DEFAULT_MAX_CHUNK})",
-    )
-    parser.add_argument(
-        "--silence-thresh",
-        type=float,
-        default=DEFAULT_SILENCE_THRESH,
-        help=f"Silence threshold in dBFS (default: {DEFAULT_SILENCE_THRESH})",
+        help="Compute device: cuda, cpu (auto-detected if omitted)",
     )
     return parser
 
@@ -443,32 +412,36 @@ def main() -> None:
     if not args.url:
         parser.error("the following arguments are required: url")
 
-    if args.min_chunk >= args.max_chunk:
-        parser.error("--min-chunk must be less than --max-chunk")
-
     out = Path(args.output)
     fmt = out.suffix.lstrip(".").lower()
     if fmt not in SUPPORTED_FORMATS:
-        parser.error(f"Unsupported format '.{fmt}'. Use one of: {', '.join(SUPPORTED_FORMATS)}")
+        parser.error(
+            f"Unsupported format '.{fmt}'. Use one of: {', '.join(SUPPORTED_FORMATS)}"
+        )
 
     _check_prerequisites()
 
     # Device ----------------------------------------------------------------
     if args.device:
-        device = torch.device(args.device)
+        device = args.device
     elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
+        device = "cuda:0"
     else:
-        device = torch.device("cpu")
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
+        device = "cpu"
+
+    dtype = "fp16" if "cuda" in device else "fp32"
     print(f"Using device: {device} ({dtype})")
 
-    # Load model ------------------------------------------------------------
-    translator, pretssel_generator, prosody_fbank_extractor, gcmvn_mean, gcmvn_std = (
-        load_expressive_model(device, dtype, gated_model_dir=args.gated_model_dir)
+    # Build pipeline args ---------------------------------------------------
+    pipeline_args = build_streaming_args(
+        device=device,
+        dtype=dtype,
+        tgt_lang=args.tgt_lang,
+        speaker_id=args.speaker_id,
     )
+
+    # Load pipeline ---------------------------------------------------------
+    agent = load_pipeline(pipeline_args)
 
     # Output paths ----------------------------------------------------------
     original_path = out.with_stem(out.stem + ".original")
@@ -479,47 +452,36 @@ def main() -> None:
         audio_path = download_audio(args.url, work_dir)
 
         # Load audio --------------------------------------------------------
-        waveform, _ = torchaudio.load(str(audio_path))
+        waveform, sr = torchaudio.load(str(audio_path))
+        if sr != INPUT_SAMPLE_RATE:
+            waveform = torchaudio.functional.resample(
+                waveform, orig_freq=sr, new_freq=INPUT_SAMPLE_RATE
+            )
+        # Convert to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
         total_seconds = waveform.shape[-1] / INPUT_SAMPLE_RATE
         print(f"Audio duration: {total_seconds:.1f}s")
 
-        # Detect silence & chunk --------------------------------------------
-        print(f"Detecting silence regions (threshold: {args.silence_thresh} dBFS) …")
-        silence_regions = find_silence_regions(waveform, thresh_dbfs=args.silence_thresh)
-        print(f"  Found {len(silence_regions)} silence region(s)")
-
-        chunks = chunk_audio_at_silences(
-            waveform, silence_regions,
-            min_chunk_s=args.min_chunk,
-            max_chunk_s=args.max_chunk,
-        )
-        chunk_durs = [c.shape[-1] / INPUT_SAMPLE_RATE for c in chunks]
-        print(
-            f"  Split into {len(chunks)} chunk(s): "
-            f"min={min(chunk_durs):.1f}s, max={max(chunk_durs):.1f}s, "
-            f"avg={sum(chunk_durs)/len(chunk_durs):.1f}s\n"
-        )
-
         # Translate ---------------------------------------------------------
-        df_str = f", duration_factor={args.duration_factor}" if args.duration_factor != 1.0 else ""
-        print(f"Translating to '{args.tgt_lang}'{df_str} …")
-        translated, output_sr = translate_chunks(
-            chunks,
-            translator, pretssel_generator, prosody_fbank_extractor,
-            gcmvn_mean, gcmvn_std,
+        print(f"Translating to '{args.tgt_lang}' ...")
+
+        translated_wav = translate_streaming(
+            waveform,
+            agent,
             tgt_lang=args.tgt_lang,
-            duration_factor=args.duration_factor,
-            device=device,
         )
 
-        # Concatenate & save ------------------------------------------------
-        full_wav = torch.cat(translated, dim=-1).unsqueeze(0)
+        # Ensure 2D for torchaudio.save: (channels, samples)
+        if translated_wav.dim() == 1:
+            translated_wav = translated_wav.unsqueeze(0)
 
+        # Save output -------------------------------------------------------
         if fmt == "wav":
-            torchaudio.save(str(out), full_wav, output_sr)
+            torchaudio.save(str(out), translated_wav, OUTPUT_SAMPLE_RATE)
         else:
             wav_tmp = work_dir / "translated.wav"
-            torchaudio.save(str(wav_tmp), full_wav, output_sr)
+            torchaudio.save(str(wav_tmp), translated_wav, OUTPUT_SAMPLE_RATE)
             convert_audio(wav_tmp, out)
 
         # Save original audio in target format

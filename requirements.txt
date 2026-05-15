@@ -1,10 +1,11 @@
-# Install torch with CUDA 12.1 support:
-#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-# Or for CPU-only:
-#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-torch>=2.0
-torchaudio>=2.0
-transformers>=4.40
+# Requires Python 3.11 (fairseq2n 0.2.x has no cp312 wheels)
+#
+# Do NOT install this file directly with `uv pip install -r requirements.txt`.
+# See README.md for the correct installation steps.
+#
+# This file is a reference of all project dependencies.
+torch==2.2.2
+torchaudio==2.2.2
+seamless_communication @ git+https://github.com/facebookresearch/seamless_communication.git
 sentencepiece
-protobuf
-numpy
+yt-dlp

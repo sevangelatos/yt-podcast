@@ -88,20 +88,18 @@ data/
     └── pretssel_melhifigan_wm.pt
 ```
 
-Then run:
-
-```bash
-python translate_expressive.py "https://youtube.com/watch?v=..." \
-    --gated-model-dir ./data/SeamlessExpressive \
-    --tgt-lang fra \
-    -o output.mp3
-```
-
-If the tarball is named `SeamlessExpressive.tar`, extract it with:
+If the tarball is `SeamlessExpressive.tar`, extract it into `data/` (relative to the script):
 
 ```bash
 mkdir -p data
 tar xf SeamlessExpressive.tar -C data/
+```
+
+Then run:
+
+```bash
+# Translate to French (model dir found automatically at data/SeamlessExpressive/)
+python translate_expressive.py "https://youtube.com/watch?v=..." --tgt-lang fra -o output.mp3
 ```
 
 **Supported target languages:** English (`eng`), French (`fra`), German (`deu`), Spanish (`spa`), Mandarin (`cmn`), Italian (`ita`).
@@ -113,18 +111,19 @@ Additional options:
 ```bash
 # Translate to German with slower speech
 python translate_expressive.py "https://youtube.com/watch?v=..." \
-    --gated-model-dir ./data/SeamlessExpressive \
     --tgt-lang deu --duration-factor 1.1
 
 # Tune text decoder beam search for quality vs speed
 python translate_expressive.py "https://youtube.com/watch?v=..." \
-    --gated-model-dir ./data/SeamlessExpressive \
     --tgt-lang fra --beam-size 10
 
 # Bias output length (len_penalty < 1 = shorter, > 1 = longer)
 python translate_expressive.py "https://youtube.com/watch?v=..." \
-    --gated-model-dir ./data/SeamlessExpressive \
     --tgt-lang eng --len-penalty 0.8
+
+# Override the model directory if weights are stored elsewhere
+python translate_expressive.py "https://youtube.com/watch?v=..." \
+    --gated-model-dir /path/to/SeamlessExpressive
 ```
 
 ## CLI Reference
@@ -152,7 +151,7 @@ python translate_expressive.py "https://youtube.com/watch?v=..." \
 | `-o, --output` | `translated.mp3` | Output file (wav, mp3, ogg) |
 | `--tgt-lang` | `eng` | Target language (`eng`, `fra`, `deu`, `spa`, `cmn`, `ita`) |
 | `--duration-factor` | `1.0` | Speech rate tuning (>1 slower, <1 faster) |
-| `--gated-model-dir` | `None` | Path to downloaded SeamlessExpressive weights directory |
+| `--gated-model-dir` | `data/SeamlessExpressive/` (relative to script) | Path to downloaded SeamlessExpressive weights directory |
 | `--device` | auto-detected | Compute device: cuda, cpu, mps |
 | `--min-chunk` | 15 | Min chunk duration in seconds |
 | `--max-chunk` | 30 | Max chunk duration (force-split threshold) |

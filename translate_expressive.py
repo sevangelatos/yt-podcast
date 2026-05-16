@@ -60,6 +60,8 @@ SUPPORTED_LANGUAGES = {
     "ita": "Italian (experimental)",
 }
 
+DEFAULT_GATED_MODEL_DIR = Path(__file__).parent / "data" / "SeamlessExpressive"
+
 
 # ---------------------------------------------------------------------------
 # SeamlessExpressive translation
@@ -272,8 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gated-model-dir",
         type=Path,
-        default=None,
-        help="Path to locally downloaded SeamlessExpressive model directory (if not using HF Hub)",
+        default=DEFAULT_GATED_MODEL_DIR,
+        help=f"Path to SeamlessExpressive model directory (default: {DEFAULT_GATED_MODEL_DIR})",
     )
     parser.add_argument(
         "--device",

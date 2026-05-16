@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-yt-podcast: Translate YouTube video audio with AI voice.
+yt-podcast: Translate YouTube video audio with expressive AI voice.
 
 Downloads audio from a YouTube video using yt-dlp and translates it
-using Meta's SeamlessM4T v2 — a speech-to-speech translation model.
+using Meta's SeamlessExpressive — a speech-to-speech translation model
+that preserves the speaker's prosody, emotion, and pacing.
 
 Audio is split at detected silence boundaries (between words/sentences)
 to avoid cutting mid-utterance, while keeping chunks large enough for
 the translation model to produce high-quality output.
 
 Requirements:
-    uv pip install "seamless_communication @ git+https://github.com/facebookresearch/seamless_communication.git"
-    uv pip install sentencepiece
+    pip install seamless_communication
     yt-dlp and ffmpeg must be available on PATH.
+    SeamlessExpressive weights require Meta approval — see README.
 
 Usage:
     python translate.py "https://youtube.com/watch?v=..." -o output.mp3
@@ -21,14 +22,13 @@ Usage:
 """
 
 import argparse
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 import torch
 import torchaudio
-
-import shutil
 
 from common import (
     DEFAULT_MAX_CHUNK,
@@ -44,139 +44,156 @@ from common import (
     resolve_device,
 )
 
-# Target languages supported by SeamlessM4T v2
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+OUTPUT_SAMPLE_RATE = 24_000  # Vocoder outputs 24 kHz (pretssel)
+
+# Target languages supported by SeamlessExpressive
 SUPPORTED_LANGUAGES = {
-    "arb": "Arabic",
-    "ben": "Bengali",
-    "cat": "Catalan",
-    "ces": "Czech",
-    "cmn": "Chinese (Mandarin)",
-    "cym": "Welsh",
-    "dan": "Danish",
-    "deu": "German",
     "eng": "English",
-    "est": "Estonian",
-    "fin": "Finnish",
     "fra": "French",
-    "hin": "Hindi",
-    "ind": "Indonesian",
-    "ita": "Italian",
-    "jpn": "Japanese",
-    "kan": "Kannada",
-    "kor": "Korean",
-    "mlt": "Maltese",
-    "nld": "Dutch",
-    "pes": "Persian (Farsi)",
-    "pol": "Polish",
-    "por": "Portuguese",
-    "ron": "Romanian",
-    "rus": "Russian",
-    "slk": "Slovak",
+    "deu": "German",
     "spa": "Spanish",
-    "swe": "Swedish",
-    "swh": "Swahili",
-    "tam": "Tamil",
-    "tel": "Telugu",
-    "tgl": "Tagalog",
-    "tha": "Thai",
-    "tur": "Turkish",
-    "ukr": "Ukrainian",
-    "urd": "Urdu",
-    "uzn": "Uzbek",
-    "vie": "Vietnamese",
+    "cmn": "Mandarin (experimental)",
+    "ita": "Italian (experimental)",
 }
 
+DEFAULT_GATED_MODEL_DIR = Path(__file__).parent / "data" / "SeamlessExpressive"
+
+
 # ---------------------------------------------------------------------------
-# SeamlessM4T v2 translation
+# SeamlessExpressive translation
 # ---------------------------------------------------------------------------
 
-def load_m4t_model(device: torch.device, dtype: torch.dtype):
-    """Load SeamlessM4T v2 Translator with vocoder."""
+def load_expressive_model(device: torch.device, dtype: torch.dtype, gated_model_dir: Path | None = None):
+    """Load SeamlessExpressive Translator + PretsselGenerator.
+
+    Returns (translator, pretssel_generator, prosody_fbank_extractor, gcmvn_mean, gcmvn_std).
+    """
+    from fairseq2.data.audio import WaveformToFbankConverter
+
+    from seamless_communication.cli.expressivity.predict.pretssel_generator import (
+        PretsselGenerator,
+    )
     from seamless_communication.inference import Translator
+    from seamless_communication.models.unity import (
+        load_gcmvn_stats,
+        load_unity_unit_tokenizer,
+    )
+    from seamless_communication.store import add_gated_assets
 
-    print("Loading SeamlessM4T v2 model …")
+    model_name = "seamless_expressivity"
+    vocoder_name = "vocoder_pretssel"
+
+    if gated_model_dir:
+        add_gated_assets(gated_model_dir)
+
+    print("Loading SeamlessExpressive models …")
+
+    unit_tokenizer = load_unity_unit_tokenizer(model_name)
 
     translator = Translator(
-        model_name_or_card="seamlessM4T_v2_large",
-        vocoder_name_or_card="vocoder_v2",
+        model_name,
+        vocoder_name_or_card=None,
         device=device,
         dtype=dtype,
     )
 
-    print("Model loaded.\n")
+    pretssel_generator = PretsselGenerator(
+        vocoder_name,
+        vocab_info=unit_tokenizer.vocab_info,
+        device=device,
+        dtype=dtype,
+    )
 
-    return translator
+    # Fbank extractor for prosody input only (no standardization — GCMVN is applied instead).
+    # The Translator handles its own fbank extraction internally (with standardize=True)
+    # when we pass raw audio tensors as input.
+    prosody_fbank_extractor = WaveformToFbankConverter(
+        num_mel_bins=80,
+        waveform_scale=2**15,
+        channel_last=True,
+        standardize=False,
+        device=device,
+        dtype=dtype,
+    )
+
+    _gcmvn_mean, _gcmvn_std = load_gcmvn_stats(vocoder_name)
+    gcmvn_mean = torch.tensor(_gcmvn_mean, device=device, dtype=dtype)
+    gcmvn_std = torch.tensor(_gcmvn_std, device=device, dtype=dtype)
+
+    print("Models loaded.\n")
+
+    return translator, pretssel_generator, prosody_fbank_extractor, gcmvn_mean, gcmvn_std
 
 
-def _get_speaker_idx(translator, tgt_lang: str) -> int:
-    """Get the default speaker index for the target language."""
-    lang_spkr_map = getattr(translator.vocoder, "lang_spkr_idx_map", None)
-    if lang_spkr_map:
-        multi_spkr = lang_spkr_map.get("multispkr", {})
-        if tgt_lang in multi_spkr and multi_spkr[tgt_lang]:
-            return multi_spkr[tgt_lang][0]
-    return -1
+def _prepare_prosody_input(
+    chunk: torch.Tensor,
+    prosody_fbank_extractor,
+    gcmvn_mean: torch.Tensor,
+    gcmvn_std: torch.Tensor,
+    device: torch.device,
+):
+    """Prepare GCMVN-normalized fbank features for the prosody encoder.
 
+    The main encoder input is handled by Translator.predict() internally
+    when we pass raw audio tensors. This function only produces the
+    GCMVN-normalized prosody input needed by both predict() and the
+    PretsselGenerator.
 
-def _build_voice_list(translator) -> dict[int, dict]:
-    """Build a mapping from speaker IDs to their language info.
-
-    Returns dict: {id: {"lang_codes": [str], "lang_names": [str]}}
-    Speaker IDs are globally unique (speaker embedding indices from multispkr).
+    Returns src_gcmvn as a SequenceData dict.
     """
-    lang_spkr_map = getattr(translator.vocoder, "lang_spkr_idx_map", None)
-    if not lang_spkr_map:
-        return {}
+    from fairseq2.data import SequenceData
 
-    voices: dict[int, dict] = {}
+    # chunk shape: (1, samples) → (samples, 1) for fbank extractor (channel_last=True)
+    wav = chunk.squeeze(0).unsqueeze(1).to(device)
 
-    # Only multispkr entries are speaker embedding indices
-    multi_spkr = lang_spkr_map.get("multispkr", {})
-    for lang_code, spkr_indices in multi_spkr.items():
-        lang_name = SUPPORTED_LANGUAGES.get(lang_code, lang_code)
-        for spkr_idx in spkr_indices:
-            if spkr_idx not in voices:
-                voices[spkr_idx] = {"lang_codes": [], "lang_names": []}
-            if lang_code not in voices[spkr_idx]["lang_codes"]:
-                voices[spkr_idx]["lang_codes"].append(lang_code)
-                voices[spkr_idx]["lang_names"].append(lang_name)
+    data = prosody_fbank_extractor({"waveform": wav, "sample_rate": INPUT_SAMPLE_RATE})
+    fbank = data["fbank"]
 
-    return voices
+    # GCMVN normalization for prosody encoder
+    gcmvn_fbank = fbank.subtract(gcmvn_mean).divide(gcmvn_std)
 
+    src_gcmvn = SequenceData(
+        seqs=gcmvn_fbank.unsqueeze(0),
+        seq_lens=torch.LongTensor([gcmvn_fbank.shape[0]]),
+        is_ragged=False,
+    )
 
-def _get_all_voice_ids(translator) -> set[int]:
-    """Collect all valid speaker indices into a set for O(1) lookup."""
-    lang_spkr_map = getattr(translator.vocoder, "lang_spkr_idx_map", None)
-    if not lang_spkr_map:
-        return set()
-    ids: set[int] = set()
-    for spkr_indices in lang_spkr_map.get("multispkr", {}).values():
-        ids.update(spkr_indices)
-    return ids
-
-
-def _resolve_voice(translator, voice_id: int) -> int:
-    """Resolve a voice ID to a speaker index. Returns -1 if not found."""
-    if voice_id in _get_all_voice_ids(translator):
-        return voice_id
-    return -1
+    return src_gcmvn
 
 
 def translate_chunks(
     chunks: list[torch.Tensor],
     translator,
+    pretssel_generator,
+    prosody_fbank_extractor,
+    gcmvn_mean: torch.Tensor,
+    gcmvn_std: torch.Tensor,
     tgt_lang: str,
     duration_factor: float,
-    spkr_idx: int,
+    beam_size: int,
+    len_penalty: float,
+    device: torch.device,
 ) -> tuple[list[torch.Tensor], int]:
-    """Translate audio chunks using SeamlessM4T v2 S2ST.
+    """Translate audio chunks using SeamlessExpressive.
 
     Returns (list_of_waveform_tensors, output_sample_rate).
     """
+    from seamless_communication.inference.generator import SequenceGeneratorOptions
+
     translated: list[torch.Tensor] = []
     total_src = 0.0
     total_tgt = 0.0
-    output_sr = INPUT_SAMPLE_RATE
+    output_sr = INPUT_SAMPLE_RATE  # updated from pretssel output
+
+    text_gen_opts = SequenceGeneratorOptions(
+        beam_size=beam_size,
+        len_penalty=len_penalty,
+        soft_max_seq_len=(1, 200),
+    )
 
     for i, chunk in enumerate(chunks, 1):
         src_dur = chunk.shape[-1] / INPUT_SAMPLE_RATE
@@ -184,22 +201,37 @@ def translate_chunks(
 
         print(f"  Translating chunk {i}/{len(chunks)} (source: {src_dur:.1f}s) … ", end="", flush=True)
 
-        # Translate chunk — pass raw audio tensor, model handles fbank internally
-        _, speech_output = translator.predict(
-            input=chunk.squeeze(0),  # (samples,) — predict expects 1D or 2D tensor
-            task_str="S2ST",
-            tgt_lang=tgt_lang,
-            sample_rate=INPUT_SAMPLE_RATE,
-            duration_factor=duration_factor,
-            spkr=spkr_idx,
+        # Prepare GCMVN-normalized prosody input for the prosody encoder.
+        # The main encoder fbank input is computed internally by Translator.predict()
+        # when we pass the raw audio tensor.
+        src_gcmvn = _prepare_prosody_input(
+            chunk, prosody_fbank_extractor, gcmvn_mean, gcmvn_std, device
         )
 
-        if speech_output is None:
+        # Pass raw audio tensor — Translator converts to fbank internally
+        # with standardize=True, matching its training config.
+        text_output, unit_output = translator.predict(
+            chunk.squeeze(0),  # (samples,) — predict expects 1D or 2D tensor
+            "s2st",
+            tgt_lang,
+            duration_factor=duration_factor,
+            prosody_encoder_input=src_gcmvn,
+            text_generation_opts=text_gen_opts,
+        )
+
+        if unit_output is None:
             print("warning: no speech output for this chunk, skipping")
             continue
+        speech_output = pretssel_generator.predict(
+            unit_output.units,
+            tgt_lang=tgt_lang,
+            prosody_encoder_input=src_gcmvn,
+        )
 
-        wav = speech_output.audio_wavs[0][0].flatten().to(torch.float32).cpu()
         output_sr = speech_output.sample_rate
+        wav = speech_output.audio_wavs[0].to(torch.float32).cpu()
+        while wav.dim() > 1:
+            wav = wav.squeeze(0)
         tgt_dur = wav.shape[-1] / output_sr
         total_tgt += tgt_dur
         print(f"translated: {tgt_dur:.1f}s")
@@ -218,7 +250,7 @@ def translate_chunks(
 def build_parser() -> argparse.ArgumentParser:
     lang_list = ", ".join(f"{k} ({v})" for k, v in SUPPORTED_LANGUAGES.items())
     parser = argparse.ArgumentParser(
-        description="Translate YouTube video audio with AI voice (SeamlessM4T v2).",
+        description="Translate YouTube video audio with expressive AI voice (SeamlessExpressive).",
         epilog=f"Supported target languages: {lang_list}",
     )
     parser.add_argument("url", nargs="?", help="YouTube video URL")
@@ -238,6 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Duration factor to tune speech rate; >1 = slower, <1 = faster (default: 1.0)",
+    )
+    parser.add_argument(
+        "--gated-model-dir",
+        type=Path,
+        default=DEFAULT_GATED_MODEL_DIR,
+        help=f"Path to SeamlessExpressive model directory (default: {DEFAULT_GATED_MODEL_DIR})",
     )
     parser.add_argument(
         "--device",
@@ -263,15 +301,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Silence threshold in dBFS (default: {DEFAULT_SILENCE_THRESH})",
     )
     parser.add_argument(
-        "--voice",
+        "--beam-size",
         type=int,
-        default=None,
-        help="Speaker ID for translated output (globally unique). Use --list-voices to see available IDs.",
+        default=5,
+        help="Beam size for text decoder; higher = better quality but slower (default: 5)",
     )
     parser.add_argument(
-        "--list-voices",
-        action="store_true",
-        help="List all available speaker IDs (globally unique) and exit",
+        "--len-penalty",
+        type=float,
+        default=1.0,
+        help="Length penalty for text decoder; <1 = shorter output, >1 = longer output (default: 1.0)",
     )
     return parser
 
@@ -280,59 +319,25 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.url and not args.list_voices:
+    if not args.url:
         parser.error("the following arguments are required: url")
 
     if args.min_chunk >= args.max_chunk:
         parser.error("--min-chunk must be less than --max-chunk")
 
-    if not args.list_voices:
-        out = Path(args.output)
-        fmt = out.suffix.lstrip(".").lower()
-        if fmt not in SUPPORTED_FORMATS:
-            parser.error(f"Unsupported format '.{fmt}'. Use one of: {', '.join(SUPPORTED_FORMATS)}")
-        check_prerequisites()
-    else:
-        out = Path(args.output)
-        fmt = out.suffix.lstrip(".").lower()
+    out = Path(args.output)
+    fmt = out.suffix.lstrip(".").lower()
+    if fmt not in SUPPORTED_FORMATS:
+        parser.error(f"Unsupported format '.{fmt}'. Use one of: {', '.join(SUPPORTED_FORMATS)}")
+
+    check_prerequisites()
 
     device, dtype = resolve_device(args.device)
 
     # Load model ------------------------------------------------------------
-    translator = load_m4t_model(device, dtype)
-
-    # List voices -----------------------------------------------------------
-    if args.list_voices:
-        voice_map = _build_voice_list(translator)
-        if not voice_map:
-            print("No voices available.")
-            return
-        current_lang = args.tgt_lang
-        lang_spkr_map = getattr(translator.vocoder, "lang_spkr_idx_map", None)
-        default_id = -1
-        if lang_spkr_map:
-            multi_spkr = lang_spkr_map.get("multispkr", {})
-            if current_lang in multi_spkr and multi_spkr[current_lang]:
-                default_id = multi_spkr[current_lang][0]
-        print(f"\n{'ID':<5} {'Languages':<40} Default")
-        print(f"{'-'*5} {'-'*40} {'-'*7}")
-        for voice_id in sorted(voice_map):
-            info = voice_map[voice_id]
-            lang_names = ", ".join(info["lang_names"])
-            marker = " <-- target" if voice_id == default_id else ""
-            print(f"  {voice_id:<3} {lang_names:<40}{marker}")
-        return
-
-    # Resolve voice ---------------------------------------------------------
-    if args.voice is not None:
-        spkr_idx = _resolve_voice(translator, args.voice)
-        if spkr_idx < 0:
-            print(f"Error: voice ID {args.voice} not found.", file=sys.stderr)
-            print("Use --list-voices to see available speaker IDs.", file=sys.stderr)
-            sys.exit(1)
-        print(f"Using speaker ID {args.voice}")
-    else:
-        spkr_idx = _get_speaker_idx(translator, args.tgt_lang)
+    translator, pretssel_generator, prosody_fbank_extractor, gcmvn_mean, gcmvn_std = (
+        load_expressive_model(device, dtype, gated_model_dir=args.gated_model_dir)
+    )
 
     # Output paths ----------------------------------------------------------
     original_path = out.with_stem(out.stem + ".original")
@@ -366,14 +371,21 @@ def main() -> None:
 
         # Translate ---------------------------------------------------------
         df_str = f", duration_factor={args.duration_factor}" if args.duration_factor != 1.0 else ""
-        voice_info = f" (voice ID: {args.voice})" if args.voice is not None else ""
-        print(f"Translating to '{args.tgt_lang}'{voice_info}{df_str} …")
+        extra_str = ""
+        if args.beam_size != 5:
+            extra_str += f", beam_size={args.beam_size}"
+        if args.len_penalty != 1.0:
+            extra_str += f", len_penalty={args.len_penalty}"
+        print(f"Translating to '{args.tgt_lang}'{df_str}{extra_str} …")
         translated, output_sr = translate_chunks(
             chunks,
-            translator,
+            translator, pretssel_generator, prosody_fbank_extractor,
+            gcmvn_mean, gcmvn_std,
             tgt_lang=args.tgt_lang,
             duration_factor=args.duration_factor,
-            spkr_idx=spkr_idx,
+            beam_size=args.beam_size,
+            len_penalty=args.len_penalty,
+            device=device,
         )
 
         # Concatenate & save ------------------------------------------------

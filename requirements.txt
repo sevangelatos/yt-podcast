@@ -1,11 +1,16 @@
-# Requires Python 3.11 (fairseq2n 0.2.x has no cp312 wheels)
+# Setup with uv:
+#   uv venv .venv --python 3.10
+#   source .venv/bin/activate
+#   uv pip install torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+#   uv pip install -r requirements.txt
 #
-# Do NOT install this file directly with `uv pip install -r requirements.txt`.
-# See README.md for the correct installation steps.
-#
-# This file is a reference of all project dependencies.
+# Or for CPU-only:
+#   uv pip install torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+#   uv pip install -r requirements.txt
 torch==2.2.2
 torchaudio==2.2.2
+fairseq2==0.2.1
 seamless_communication @ git+https://github.com/facebookresearch/seamless_communication.git
 sentencepiece
+numpy
 yt-dlp

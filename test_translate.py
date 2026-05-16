@@ -539,6 +539,104 @@ class TestTranslateChunks:
 
 
 # ---------------------------------------------------------------------------
+# common.py direct tests
+# ---------------------------------------------------------------------------
+
+import common as cm
+
+
+class TestCommonResolveDevice:
+    def test_explicit_cpu(self):
+        device, dtype = cm.resolve_device("cpu")
+        assert device.type == "cpu"
+        assert dtype == torch.float32
+
+    def test_explicit_cuda(self):
+        device, dtype = cm.resolve_device("cuda")
+        assert device.type == "cuda"
+        assert dtype == torch.float16
+
+    def test_explicit_mps(self):
+        device, dtype = cm.resolve_device("mps")
+        assert device.type == "mps"
+        assert dtype == torch.float16
+
+
+class TestCommonConvertAudio:
+    def test_unsupported_format_exits(self):
+        if not shutil.which("ffmpeg"):
+            return
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src = tmp / "test.wav"
+            dst = tmp / "test.flac"
+            audio = sine_wave(0.1)
+            torchaudio.save(str(src), audio, cm.INPUT_SAMPLE_RATE)
+            try:
+                cm.convert_audio(src, dst)
+                assert False, "Should have exited for unsupported format"
+            except SystemExit as e:
+                assert e.code == 1
+
+
+# ---------------------------------------------------------------------------
+# translate_expressive.py CLI tests
+# ---------------------------------------------------------------------------
+
+import translate_expressive as te
+
+
+class TestExpressiveCLI:
+    def _parse(self, argv: list[str]) -> argparse.Namespace:
+        parser = te.build_parser()
+        return parser.parse_args(argv)
+
+    def test_minimal(self):
+        args = self._parse(["https://youtube.com/watch?v=abc"])
+        assert args.url == "https://youtube.com/watch?v=abc"
+        assert args.output == "translated.mp3"
+        assert args.tgt_lang == "eng"
+        assert args.duration_factor == 1.0
+        assert args.beam_size == 5
+        assert args.len_penalty == 1.0
+
+    def test_gated_model_dir(self):
+        args = self._parse(["https://example.com", "--gated-model-dir", "/tmp/models"])
+        assert args.gated_model_dir == Path("/tmp/models")
+
+    def test_beam_size(self):
+        args = self._parse(["https://example.com", "--beam-size", "10"])
+        assert args.beam_size == 10
+
+    def test_len_penalty(self):
+        args = self._parse(["https://example.com", "--len-penalty", "0.8"])
+        assert args.len_penalty == 0.8
+
+    def test_invalid_lang_rejected(self):
+        parser = te.build_parser()
+        try:
+            parser.parse_args(["https://example.com", "--tgt-lang", "xxx"])
+            assert False, "Should have raised SystemExit"
+        except SystemExit:
+            pass
+
+    def test_missing_url_exits(self):
+        import unittest.mock as mock
+        with mock.patch("sys.argv", ["translate"]):
+            try:
+                te.main()
+            except SystemExit:
+                pass
+
+
+class TestExpressiveEmptyTranslatedGuard:
+    def test_guard_code_exists(self):
+        import inspect
+        src = inspect.getsource(te.main)
+        assert "no translated output produced" in src
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 

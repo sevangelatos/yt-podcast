@@ -21,14 +21,13 @@ Usage:
 """
 
 import argparse
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 import torch
 import torchaudio
-
-import shutil
 
 from common import (
     DEFAULT_MAX_CHUNK,
@@ -144,15 +143,19 @@ def _build_voice_list(translator) -> dict[int, dict]:
     return voices
 
 
-def _get_all_voice_ids(translator) -> set[int]:
+def _get_all_voice_ids(translator, *, _cache={}) -> set[int]:
     """Collect all valid speaker indices into a set for O(1) lookup."""
-    lang_spkr_map = getattr(translator.vocoder, "lang_spkr_idx_map", None)
-    if not lang_spkr_map:
-        return set()
-    ids: set[int] = set()
-    for spkr_indices in lang_spkr_map.get("multispkr", {}).values():
-        ids.update(spkr_indices)
-    return ids
+    obj_id = id(translator.vocoder)
+    if obj_id not in _cache:
+        lang_spkr_map = getattr(translator.vocoder, "lang_spkr_idx_map", None)
+        if not lang_spkr_map:
+            _cache[obj_id] = set()
+        else:
+            ids: set[int] = set()
+            for spkr_indices in lang_spkr_map.get("multispkr", {}).values():
+                ids.update(spkr_indices)
+            _cache[obj_id] = ids
+    return _cache[obj_id]
 
 
 def _resolve_voice(translator, voice_id: int) -> int:
@@ -293,8 +296,8 @@ def main() -> None:
             parser.error(f"Unsupported format '.{fmt}'. Use one of: {', '.join(SUPPORTED_FORMATS)}")
         check_prerequisites()
     else:
-        out = Path(args.output)
-        fmt = out.suffix.lstrip(".").lower()
+        out = None
+        fmt = None
 
     device, dtype = resolve_device(args.device)
 
@@ -377,6 +380,10 @@ def main() -> None:
         )
 
         # Concatenate & save ------------------------------------------------
+        if not translated:
+            print("Error: no translated output produced.", file=sys.stderr)
+            sys.exit(1)
+
         full_wav = torch.cat(translated, dim=-1).unsqueeze(0)
 
         if fmt == "wav":

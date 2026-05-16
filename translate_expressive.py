@@ -16,9 +16,9 @@ Requirements:
     SeamlessExpressive weights require Meta approval — see README.
 
 Usage:
-    python translate.py "https://youtube.com/watch?v=..." -o output.mp3
-    python translate.py "https://youtube.com/watch?v=..." --tgt-lang fra
-    python translate.py "https://youtube.com/watch?v=..." --duration-factor 1.1
+    python translate_expressive.py "https://youtube.com/watch?v=..." -o output.mp3
+    python translate_expressive.py "https://youtube.com/watch?v=..." --tgt-lang fra
+    python translate_expressive.py "https://youtube.com/watch?v=..." --duration-factor 1.1
 """
 
 import argparse
@@ -47,8 +47,6 @@ from common import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-OUTPUT_SAMPLE_RATE = 24_000  # Vocoder outputs 24 kHz (pretssel)
 
 # Target languages supported by SeamlessExpressive
 SUPPORTED_LANGUAGES = {
@@ -212,7 +210,7 @@ def translate_chunks(
         # with standardize=True, matching its training config.
         text_output, unit_output = translator.predict(
             chunk.squeeze(0),  # (samples,) — predict expects 1D or 2D tensor
-            "s2st",
+            "S2ST",
             tgt_lang,
             duration_factor=duration_factor,
             prosody_encoder_input=src_gcmvn,
@@ -389,6 +387,10 @@ def main() -> None:
         )
 
         # Concatenate & save ------------------------------------------------
+        if not translated:
+            print("Error: no translated output produced.", file=sys.stderr)
+            sys.exit(1)
+
         full_wav = torch.cat(translated, dim=-1).unsqueeze(0)
 
         if fmt == "wav":

@@ -13,3 +13,4 @@ fairseq2==0.2.1
 seamless_communication @ git+https://github.com/facebookresearch/seamless_communication.git
 sentencepiece
 numpy
+yt-dlp

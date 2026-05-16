@@ -22,7 +22,6 @@ Usage:
 """
 
 import argparse
-import logging
 import shutil
 import sys
 import tempfile
@@ -44,12 +43,6 @@ from common import (
     find_silence_regions,
     resolve_device,
 )
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s -- %(name)s: %(message)s",
-)
-logger = logging.getLogger("yt-podcast")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -224,7 +217,9 @@ def translate_chunks(
             text_generation_opts=text_gen_opts,
         )
 
-        assert unit_output is not None
+        if unit_output is None:
+            print("warning: no speech output for this chunk, skipping")
+            continue
         speech_output = pretssel_generator.predict(
             unit_output.units,
             tgt_lang=tgt_lang,

@@ -221,18 +221,16 @@ class TestChunkAudio:
         )
         assert len(chunks) == 1
 
-    def test_remaining_less_than_half_second_dropped(self):
-        audio = cat_waveforms(
-            sine_wave(20.0),
-            silence(0.3),
-            sine_wave(0.2),
-        )
+    def test_trailing_under_half_second_triggers_value_error(self):
+        audio = sine_wave(30.3)
         regions = tr.find_silence_regions(audio)
-        chunks = tr.chunk_audio_at_silences(
-            audio, regions, min_chunk_s=5, max_chunk_s=30
-        )
-        total = sum(c.shape[-1] for c in chunks)
-        assert total == audio.shape[-1]
+        try:
+            tr.chunk_audio_at_silences(
+                audio, regions, min_chunk_s=5, max_chunk_s=30
+            )
+            assert False, "Should have raised ValueError"
+        except ValueError:
+            pass
 
 
 # ---------------------------------------------------------------------------

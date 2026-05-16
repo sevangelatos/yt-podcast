@@ -1,14 +1,11 @@
-# Requires Python 3.11 (fairseq2n 0.2.x has no cp312 wheels)
-#
-# Install torch+torchaudio with CUDA 12.1 support FIRST:
+# Setup with uv:
+#   uv venv .venv --python 3.10
+#   source .venv/bin/activate
 #   uv pip install torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+#   uv pip install -r requirements.txt
+#
 # Or for CPU-only:
 #   uv pip install torch==2.2.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cpu
-#
-# Then install seamless_communication from GitHub:
-#   uv pip install "seamless_communication @ git+https://github.com/facebookresearch/seamless_communication.git"
-#
-# Or install all non-torch deps at once:
 #   uv pip install -r requirements.txt
 torch==2.2.2
 torchaudio==2.2.2

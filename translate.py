@@ -43,6 +43,7 @@ logger = logging.getLogger("yt-podcast")
 # ---------------------------------------------------------------------------
 
 INPUT_SAMPLE_RATE = 16_000  # SeamlessExpressive expects 16 kHz input
+OUTPUT_SAMPLE_RATE = 24_000  # Vocoder outputs 24 kHz (pretssel)
 SUPPORTED_FORMATS = ("wav", "mp3", "ogg")
 
 # Target languages supported by SeamlessExpressive
@@ -322,16 +323,26 @@ def translate_chunks(
     gcmvn_std: torch.Tensor,
     tgt_lang: str,
     duration_factor: float,
+    beam_size: int,
+    len_penalty: float,
     device: torch.device,
 ) -> tuple[list[torch.Tensor], int]:
     """Translate audio chunks using SeamlessExpressive.
 
     Returns (list_of_waveform_tensors, output_sample_rate).
     """
+    from seamless_communication.inference.generator import SequenceGeneratorOptions
+
     translated: list[torch.Tensor] = []
     total_src = 0.0
     total_tgt = 0.0
     output_sr = INPUT_SAMPLE_RATE  # updated from pretssel output
+
+    text_gen_opts = SequenceGeneratorOptions(
+        beam_size=beam_size,
+        len_penalty=len_penalty,
+        soft_max_seq_len=(1, 200),
+    )
 
     for i, chunk in enumerate(chunks, 1):
         src_dur = chunk.shape[-1] / INPUT_SAMPLE_RATE
@@ -354,6 +365,7 @@ def translate_chunks(
             tgt_lang,
             duration_factor=duration_factor,
             prosody_encoder_input=src_gcmvn,
+            text_generation_opts=text_gen_opts,
         )
 
         assert unit_output is not None
@@ -364,7 +376,9 @@ def translate_chunks(
         )
 
         output_sr = speech_output.sample_rate
-        wav = speech_output.audio_wavs[0][0].to(torch.float32).cpu()
+        wav = speech_output.audio_wavs[0].to(torch.float32).cpu()
+        while wav.dim() > 1:
+            wav = wav.squeeze(0)
         tgt_dur = wav.shape[-1] / output_sr
         total_tgt += tgt_dur
         print(f"translated: {tgt_dur:.1f}s")
@@ -432,6 +446,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_SILENCE_THRESH,
         help=f"Silence threshold in dBFS (default: {DEFAULT_SILENCE_THRESH})",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        help="Beam size for text decoder; higher = better quality but slower (default: 5)",
+    )
+    parser.add_argument(
+        "--len-penalty",
+        type=float,
+        default=1.0,
+        help="Length penalty for text decoder; <1 = shorter output, >1 = longer output (default: 1.0)",
     )
     return parser
 
@@ -502,13 +528,20 @@ def main() -> None:
 
         # Translate ---------------------------------------------------------
         df_str = f", duration_factor={args.duration_factor}" if args.duration_factor != 1.0 else ""
-        print(f"Translating to '{args.tgt_lang}'{df_str} …")
+        extra_str = ""
+        if args.beam_size != 5:
+            extra_str += f", beam_size={args.beam_size}"
+        if args.len_penalty != 1.0:
+            extra_str += f", len_penalty={args.len_penalty}"
+        print(f"Translating to '{args.tgt_lang}'{df_str}{extra_str} …")
         translated, output_sr = translate_chunks(
             chunks,
             translator, pretssel_generator, prosody_fbank_extractor,
             gcmvn_mean, gcmvn_std,
             tgt_lang=args.tgt_lang,
             duration_factor=args.duration_factor,
+            beam_size=args.beam_size,
+            len_penalty=args.len_penalty,
             device=device,
         )
 

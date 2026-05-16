@@ -349,7 +349,7 @@ class TestPrerequisites:
     @patch("shutil.which")
     def test_passes_when_both_found(self, mock_which):
         mock_which.return_value = "/usr/bin/fake"
-        tr._check_prerequisites()
+        tr.check_prerequisites()
 
     @patch("shutil.which")
     def test_exits_when_ytdlp_missing(self, mock_which):
@@ -357,7 +357,7 @@ class TestPrerequisites:
             return "/usr/bin/ffmpeg" if prog == "ffmpeg" else None
         mock_which.side_effect = which_side_effect
         try:
-            tr._check_prerequisites()
+            tr.check_prerequisites()
             assert False, "Should have exited"
         except SystemExit:
             pass
@@ -368,7 +368,7 @@ class TestPrerequisites:
             return "/usr/bin/yt-dlp" if prog == "yt-dlp" else None
         mock_which.side_effect = which_side_effect
         try:
-            tr._check_prerequisites()
+            tr.check_prerequisites()
             assert False, "Should have exited"
         except SystemExit:
             pass
@@ -423,7 +423,7 @@ class TestMainFlow:
         with patch("sys.argv", ["translate.py", "https://example.com", "--voice", "999"]):
             with patch.object(tr, "load_m4t_model", capture_dtype):
                 with patch.object(tr, "download_audio", mock_download):
-                    with patch.object(tr, "_check_prerequisites"):
+                    with patch.object(tr, "check_prerequisites"):
                         with patch("shutil.which", return_value="/usr/bin/fake"):
                             try:
                                 tr.main()
@@ -452,7 +452,7 @@ class TestMainFlow:
         with patch("sys.argv", ["translate.py", "https://example.com", "--device", "mps"]):
             with patch.object(tr, "load_m4t_model", capture_dtype):
                 with patch.object(tr, "download_audio", mock_download):
-                    with patch.object(tr, "_check_prerequisites"):
+                    with patch.object(tr, "check_prerequisites"):
                         with patch("shutil.which", return_value="/usr/bin/fake"):
                             with patch("torch.backends.mps") as mock_mps:
                                 mock_mps.is_available.return_value = True
@@ -475,7 +475,7 @@ class TestMainFlow:
         with patch("sys.argv", ["translate.py", "https://example.com", "--device", "cuda"]):
             with patch.object(tr, "load_m4t_model", capture_dtype):
                 with patch.object(tr, "download_audio", mock_download):
-                    with patch.object(tr, "_check_prerequisites"):
+                    with patch.object(tr, "check_prerequisites"):
                         with patch("shutil.which", return_value="/usr/bin/fake"):
                             try:
                                 tr.main()
@@ -496,7 +496,7 @@ class TestMainFlow:
         with patch("sys.argv", ["translate.py", "https://example.com", "--device", "cpu"]):
             with patch.object(tr, "load_m4t_model", capture_dtype):
                 with patch.object(tr, "download_audio", mock_download):
-                    with patch.object(tr, "_check_prerequisites"):
+                    with patch.object(tr, "check_prerequisites"):
                         with patch("shutil.which", return_value="/usr/bin/fake"):
                             try:
                                 tr.main()
